@@ -1,46 +1,29 @@
 local Bridge = {}
 Bridge.__index = Bridge
 
-local PROTOCOL_VERSION = "1.1"
-local BUILT_IN_HANDLER = "__client_info"
+local MAX_RECONNECT_ATTEMPTS = 5
+local INITIAL_RECONNECT_DELAY = 1
+local MAX_RECONNECT_DELAY = 15
+local STABLE_CONNECTION_SECONDS = 10
+local HANDLER_PROTOCOL_VERSION = 1
 
-local function get_http_service()
-    return game:GetService("HttpService")
+local function retry_delay(attempt)
+    return math.min(INITIAL_RECONNECT_DELAY * (2 ^ (attempt - 1)), MAX_RECONNECT_DELAY)
 end
 
-local function get_player()
-    while not game:IsLoaded() do task.wait(1) end
-    local players = game:GetService("Players")
-    local player = players.LocalPlayer
-    while not player do
-        task.wait(1)
-        player = players.LocalPlayer
-    end
-    return player
+local function table_count(values)
+    local count = 0
+    for _ in pairs(values) do count += 1 end
+    return count
 end
 
-local function avatar_url(user_id)
-    local url = "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds="
-        .. tostring(user_id)
-        .. "&includeBackground=false&size=420x420&format=Png&isCircular=false"
-
-    local body = nil
-    local ok = pcall(function()
-        if game.HttpGet then
-            body = game:HttpGet(url)
-        elseif get_http_service().GetAsync then
-            body = get_http_service():GetAsync(url)
-        end
-    end)
-
-    if ok and body then
-        local decoded_ok, payload = pcall(get_http_service().JSONDecode, get_http_service(), body)
-        if decoded_ok and payload and payload.data and payload.data[1] then
-            return payload.data[1].imageUrl
-        end
-    end
-
-    return nil
+local function is_permanent_connect_error(message)
+    local text = string.lower(tostring(message or ""))
+    return string.find(text, "unauthorized", 1, true) ~= nil
+        or string.find(text, "authentication", 1, true) ~= nil
+        or string.find(text, "401", 1, true) ~= nil
+        or string.find(text, "403", 1, true) ~= nil
+        or string.find(text, "invalid url", 1, true) ~= nil
 end
 
 function Bridge.new()
@@ -51,79 +34,292 @@ function Bridge.new()
 
     local self = setmetatable({}, Bridge)
     self.handlers = {}
-    self.assigned_handlers = {}
+    self.synced_handlers = {}
+    self.handler_revision = 0
+    self.handler_sync_ready = false
+    self.handler_sync_failed_revision = 0
     self.uuid = nil
     self.url = nil
     self.ws = nil
     self.connected = false
-    self.reconnect_delay = 5
     self.running = false
+    self.connection_state = "Disconnected"
+    self.connection_generation = 0
+    self.retry_attempt = 0
+    self.permanent_sync_error = nil
+    self.update_failures = {}
 
-    local player = get_player()
-    self.player = player
+    while not game:IsLoaded() do task.wait(1) end
+    local player = game.Players.LocalPlayer
+    while not player do task.wait(1); player = game.Players.LocalPlayer end
     self.client_id = tostring(player.UserId)
 
-    self:_install_built_in_handlers()
     shared.__active_bridge = self
-
     return self
-end
-
-function Bridge:_install_built_in_handlers()
-    self.handlers[BUILT_IN_HANDLER] = function()
-        local player = self.player or get_player()
-        return {
-            username = player.Name,
-            display_name = player.DisplayName,
-            user_id = player.UserId,
-            avatar_image_url = avatar_url(player.UserId),
-            place_id = game.PlaceId,
-            job_id = game.JobId,
-        }
-    end
-end
-
-function Bridge:_client_info()
-    local ok, info = pcall(self.handlers[BUILT_IN_HANDLER])
-    if ok then
-        return info
-    end
-    return {
-        username = "Unknown",
-        user_id = tonumber(self.client_id) or self.client_id,
-        avatar_image_url = avatar_url(self.client_id),
-        place_id = game.PlaceId,
-        error = tostring(info),
-    }
 end
 
 function Bridge:On(handler_name, callback)
     self.handlers[handler_name] = callback
-    self.assigned_handlers[handler_name] = true
 end
 
-function Bridge:Off(handler_name)
-    if handler_name == BUILT_IN_HANDLER then
+function Bridge:_compile_handler(entry)
+    if entry.server_owned then
+        return true, nil
+    end
+    if type(entry.id) ~= "string" or entry.id == "" or type(entry.source) ~= "string" then
+        return false, "handler_source_invalid: invalid handler entry"
+    end
+    if type(loadstring) ~= "function" then
+        return false, "client_dynamic_handlers_unsupported: loadstring is unavailable"
+    end
+    local compile_ok, compiled, compile_error = pcall(loadstring, entry.source, "@bridge-handler/" .. entry.id)
+    if not compile_ok then
+        return false, "handler_compile_failed: " .. tostring(compiled)
+    end
+    if not compiled then
+        return false, "handler_compile_failed: " .. tostring(compile_error)
+    end
+    local loaded, exported = pcall(compiled)
+    if not loaded then
+        return false, "handler_load_failed: " .. tostring(exported)
+    end
+    if type(exported) == "function" then
+        return true, exported
+    elseif type(exported) == "table" and type(exported.Run) == "function" then
+        return true, function(args) return exported.Run(args) end
+    elseif exported ~= nil then
+        return true, function() return exported end
+    end
+    return false, "handler_source_invalid: handler must return a function, a table with Run, or a result"
+end
+
+function Bridge:_send_sync_result(revision, success, handler_errors, message)
+    if not self.ws then return end
+    local payload = game.HttpService:JSONEncode({
+        type = "handler_sync_result",
+        protocol = HANDLER_PROTOCOL_VERSION,
+        revision = revision,
+        success = success,
+        loaded_handlers = table_count(self.synced_handlers),
+        handler_errors = handler_errors,
+        error = message
+    })
+    pcall(function() self.ws:Send(payload) end)
+end
+
+function Bridge:_apply_handler_manifest(data)
+    if data.protocol ~= HANDLER_PROTOCOL_VERSION or type(data.revision) ~= "number" or data.revision < 1 or type(data.handlers) ~= "table" then
+        self.handler_sync_ready = false
+        self.permanent_sync_error = "protocol_mismatch: unsupported handler manifest"
+        self:_send_sync_result(data.revision or 0, false, nil, "protocol_mismatch: unsupported handler manifest")
         return
     end
-    self.handlers[handler_name] = nil
-    self.assigned_handlers[handler_name] = nil
+    local next_registry = {}
+    local failures = {}
+    local seen = {}
+    for _, entry in ipairs(data.handlers) do
+        local id = type(entry) == "table" and entry.id or nil
+        if type(id) ~= "string" or id == "" then
+            failures[tostring(id or "unknown")] = "handler_source_invalid: invalid handler identifier"
+        elseif seen[id] then
+            failures[id] = "duplicate_handler_identifier: " .. id
+        else
+            seen[id] = true
+            local ok, handler_or_error = self:_compile_handler(entry)
+            if not ok then
+                failures[id] = handler_or_error
+            elseif handler_or_error ~= nil then
+                next_registry[id] = handler_or_error
+            end
+        end
+    end
+    self.synced_handlers = next_registry
+    self.handler_revision = data.revision
+    self.handler_sync_ready = true
+    self.handler_sync_failed_revision = next(failures) and data.revision or 0
+    self.update_failures = {}
+    self.permanent_sync_error = nil
+    self:_send_sync_result(data.revision, next(failures) == nil, next(failures) and failures or nil,
+        next(failures) and "handler_manifest_partially_loaded" or nil)
+end
+
+function Bridge:_apply_handler_update(data)
+    self.handler_sync_ready = false
+    if data.protocol ~= HANDLER_PROTOCOL_VERSION or type(data.revision) ~= "number" or data.revision < self.handler_revision or type(data.handler_entry) ~= "table" then
+        self.handler_sync_ready = false
+        self.handler_sync_failed_revision = data.revision or 0
+        self.permanent_sync_error = "protocol_mismatch: invalid handler update"
+        self:_send_sync_result(data.revision or 0, false, nil, "protocol_mismatch: invalid handler update")
+        return
+    end
+    local entry = data.handler_entry
+    if self.handler_sync_failed_revision ~= data.revision then
+        self.handler_sync_failed_revision = 0
+        self.update_failures = {}
+    end
+    local ok, handler_or_error = self:_compile_handler(entry)
+    if not ok then
+        self.synced_handlers[tostring(entry.id or "unknown")] = nil
+        self.handler_sync_failed_revision = data.revision
+        self.handler_revision = data.revision
+        self.update_failures[tostring(entry.id or "unknown")] = handler_or_error
+        if data.final then
+            self.handler_sync_ready = true
+            self:_send_sync_result(data.revision, false, self.update_failures, "handler_update_partially_loaded")
+        end
+        return
+    end
+    self.synced_handlers[entry.id] = handler_or_error
+    self.update_failures[entry.id] = nil
+    self.handler_revision = data.revision
+    if data.final then
+        self.handler_sync_ready = true
+        local partial = next(self.update_failures) ~= nil
+        self:_send_sync_result(data.revision, not partial, partial and self.update_failures or nil,
+            partial and "handler_update_partially_loaded" or nil)
+    end
+end
+
+function Bridge:_apply_handler_remove(data)
+    self.handler_sync_ready = false
+    if data.protocol ~= HANDLER_PROTOCOL_VERSION or type(data.revision) ~= "number" or data.revision < self.handler_revision or type(data.handler_id) ~= "string" or data.handler_id == "" then
+        self.handler_sync_ready = false
+        self.handler_sync_failed_revision = data.revision or 0
+        self.permanent_sync_error = "protocol_mismatch: invalid handler removal"
+        self:_send_sync_result(data.revision or 0, false, nil, "protocol_mismatch: invalid handler removal")
+        return
+    end
+    if self.handler_sync_failed_revision ~= data.revision then
+        self.handler_sync_failed_revision = 0
+        self.update_failures = {}
+    end
+    self.synced_handlers[data.handler_id] = nil
+    self.handler_revision = data.revision
+    if data.final then
+        self.handler_sync_ready = true
+        local partial = next(self.update_failures) ~= nil
+        self:_send_sync_result(data.revision, not partial, partial and self.update_failures or nil,
+            partial and "handler_update_partially_loaded" or nil)
+    end
+end
+
+function Bridge:_execute_handler(data)
+    local handler = self.synced_handlers[data.handler] or self.handlers[data.handler]
+    if data.handler_source then
+        if type(loadstring) ~= "function" then
+            return false, "client_dynamic_handlers_unsupported: loadstring is unavailable"
+        end
+        local compile_ok, compiled, compile_error = pcall(
+            loadstring,
+            data.handler_source,
+            "@bridge-handler/" .. tostring(data.handler)
+        )
+        if not compile_ok then
+            return false, "handler_compile_failed: " .. tostring(compiled)
+        end
+        if not compiled then
+            return false, "handler_compile_failed: " .. tostring(compile_error)
+        end
+        local loaded, exported = pcall(compiled)
+        if not loaded then
+            return false, "handler_load_failed: " .. tostring(exported)
+        end
+        if type(exported) == "function" then
+            handler = exported
+        elseif type(exported) == "table" and type(exported.Run) == "function" then
+            handler = function(args) return exported.Run(args) end
+        elseif exported ~= nil then
+            return true, exported
+        else
+            return false, "handler_source_invalid: handler must return a function, a table with Run, or a result"
+        end
+    end
+    if not handler then
+        if not self.handler_sync_ready then
+            return false, "handler_synchronization_pending: revision " .. tostring(self.handler_revision)
+        end
+        return false, "unknown_handler_identifier: " .. tostring(data.handler)
+    end
+    local handled, response = pcall(handler, data.args)
+    if not handled then
+        return false, "handler_runtime_error: " .. tostring(response)
+    end
+    return true, response
 end
 
 function Bridge:Connect(server_url)
-    assert(server_url, "Server URL required")
-    self.url = server_url
+    assert(type(server_url) == "string" and server_url ~= "", "Server URL required")
+
+    self.connection_generation += 1
+    local generation = self.connection_generation
     self.running = true
+    self.connected = false
+    self.connection_state = "Connecting"
+    self.retry_attempt = 0
+    self.permanent_sync_error = nil
+    self.url = server_url
+
+    if self.ws then
+        pcall(function() self.ws:Close() end)
+        self.ws = nil
+    end
+
     task.spawn(function()
-        while self.running do
-            self:_connect_and_listen()
-            if not self.running then break end
-            task.wait(self.reconnect_delay)
-        end
+        self:_connection_loop(generation)
     end)
 end
 
-function Bridge:_websocket_connect()
+function Bridge:_connection_loop(generation)
+    while self.running and self.connection_generation == generation do
+        local retryable, reason, stable = self:_connect_and_listen(generation)
+        if stable then
+            self.retry_attempt = 0
+        end
+        if not self.running or self.connection_generation ~= generation then
+            return
+        end
+        if not retryable then
+            self.running = false
+            self.connected = false
+            self.connection_state = "Disconnected"
+            warn("[Bridge] Connection stopped: " .. tostring(reason))
+            return
+        end
+        if self.retry_attempt >= MAX_RECONNECT_ATTEMPTS then
+            self.running = false
+            self.connected = false
+            warn("[Bridge] Reconnection failed after " .. MAX_RECONNECT_ATTEMPTS .. " attempts: " .. tostring(reason))
+            return
+        end
+
+        self.retry_attempt += 1
+        self.connection_state = "Reconnecting"
+        local delay = retry_delay(self.retry_attempt)
+        warn(string.format(
+            "[Bridge] Connection lost. Reconnecting in %d second%s (attempt %d/%d).",
+            delay,
+            delay == 1 and "" or "s",
+            self.retry_attempt,
+            MAX_RECONNECT_ATTEMPTS
+        ))
+        if not self:_wait_for_retry(delay, generation) then
+            return
+        end
+    end
+end
+
+function Bridge:_wait_for_retry(delay, generation)
+    local deadline = os.clock() + delay
+    while os.clock() < deadline do
+        if not self.running or self.connection_generation ~= generation then
+            return false
+        end
+        task.wait(math.min(0.1, deadline - os.clock()))
+    end
+    return self.running and self.connection_generation == generation
+end
+
+function Bridge:_websocket_connector()
     if WebSocket and WebSocket.connect then
         return WebSocket.connect
     elseif syn and syn.websocket and syn.websocket.connect then
@@ -134,144 +330,33 @@ function Bridge:_websocket_connect()
     return nil
 end
 
-function Bridge:_send(payload)
-    local encoded = get_http_service():JSONEncode(payload)
-    pcall(function()
-        if self.ws then
-            self.ws:Send(encoded)
-        end
-    end)
-end
-
-function Bridge:_ack(handler_id, status, message)
-    self:_send({
-        type = "handler_ack",
-        handler_id = handler_id,
-        status = status,
-        message = message,
-    })
-end
-
-function Bridge:_load_handler(record)
-    local handler_id = tostring(record.id or record.name or "")
-    local source = record.source
-    if handler_id == "" or type(source) ~= "string" then
-        self:_ack(handler_id, "error", "Invalid handler payload")
-        return
-    end
-
-    local chunk, compile_error = loadstring(source)
-    if not chunk then
-        self:_ack(handler_id, "error", "Compile error: " .. tostring(compile_error))
-        return
-    end
-
-    local env = {
-        Bridge = self,
-        game = game,
-        workspace = workspace,
-        script = script,
-        shared = shared,
-        task = task,
-        wait = task.wait,
-        print = print,
-        warn = warn,
-        error = error,
-        assert = assert,
-        pcall = pcall,
-        xpcall = xpcall,
-        tostring = tostring,
-        tonumber = tonumber,
-        type = type,
-        pairs = pairs,
-        ipairs = ipairs,
-        next = next,
-        select = select,
-        table = table,
-        string = string,
-        math = math,
-        os = os,
-        coroutine = coroutine,
-        Vector3 = Vector3,
-        CFrame = CFrame,
-        Color3 = Color3,
-        Instance = Instance,
-        Enum = Enum,
-    }
-
-    if setfenv then
-        pcall(setfenv, chunk, setmetatable(env, { __index = getfenv and getfenv(0) or _G }))
-    end
-
-    local ok, result = pcall(chunk, self)
-    if not ok then
-        self:_ack(handler_id, "error", "Load error: " .. tostring(result))
-        return
-    end
-
-    if type(result) == "function" then
-        self.handlers[handler_id] = result
-    elseif type(self.handlers[handler_id]) ~= "function" then
-        self:_ack(handler_id, "error", "Handler source must return a function or call Bridge:On")
-        return
-    end
-
-    self.assigned_handlers[handler_id] = true
-    self:_ack(handler_id, "ok", "loaded")
-end
-
-function Bridge:_replace_manifest(records)
-    for handler_id in pairs(self.assigned_handlers) do
-        self:Off(handler_id)
-    end
-
-    for _, record in ipairs(records or {}) do
-        self:_load_handler(record)
-    end
-
-    self:_ack("manifest", "ok", "synced")
-end
-
-function Bridge:_handle_command(data)
-    local handler = self.handlers[data.handler]
-    local result = nil
-    if not handler then
-        result = "No handler: " .. tostring(data.handler)
-    else
-        local ok, response = pcall(handler, data.args or {})
-        if ok then
-            result = response
-        else
-            result = "Handler error: " .. tostring(response)
-            warn("[Bridge] Handler error:", response)
-        end
-    end
-
-    self:_send({
-        type = "result",
-        request_id = data.request_id,
-        result = result,
-    })
-end
-
-function Bridge:_connect_and_listen()
-    local ws_connect = self:_websocket_connect()
+function Bridge:_connect_and_listen(generation)
+    local ws_connect = self:_websocket_connector()
     if not ws_connect then
-        warn("[Bridge] No WebSocket implementation found!")
-        self.running = false
-        return
+        return false, "No WebSocket implementation found", false
     end
 
     local separator = string.find(self.url, "?", 1, true) and "&" or "?"
-    local full_url = self.url .. separator .. "cid=" .. self.client_id .. "&protocol=" .. PROTOCOL_VERSION
-    local connect_ok, ws = pcall(ws_connect, full_url)
-    if not connect_ok or not ws then
-        warn("[Bridge] WebSocket connection failed:", ws)
-        return
+    local full_url = self.url .. separator .. "cid=" .. self.client_id
+    local ok, ws_or_error = pcall(ws_connect, full_url)
+    if not ok then
+        local reason = tostring(ws_or_error)
+        return not is_permanent_connect_error(reason), reason, false
+    end
+    local ws = ws_or_error
+    if not ws then
+        return true, "WebSocket connection failed", false
+    end
+    if self.connection_generation ~= generation or not self.running then
+        pcall(function() ws:Close() end)
+        return false, "Connection attempt was canceled", false
     end
 
     self.ws = ws
     self.connected = true
+    self.connection_state = "Registering"
+    self.handler_sync_ready = false
+    local connected_at = os.clock()
     print("[Bridge] WebSocket connected, waiting for welcome...")
 
     local use_event = false
@@ -280,89 +365,118 @@ function Bridge:_connect_and_listen()
     elseif ws.OnMessage then
         use_event = true
     else
-        warn("[Bridge] WebSocket has no Receive/OnMessage")
         self.connected = false
+        self.ws = nil
         pcall(function() ws:Close() end)
-        return
+        return false, "WebSocket has no Receive/OnMessage interface", false
     end
 
     if ws.OnClose then
         ws.OnClose:Connect(function()
-            self.connected = false
-            print("[Bridge] WebSocket closed by server")
+            if self.ws == ws and self.connection_generation == generation then
+                self.connected = false
+                print("[Bridge] WebSocket closed by server")
+            end
         end)
     end
 
     local welcome_received = false
-    while self.connected and self.running do
+    local disconnect_reason = "WebSocket connection closed"
+    while self.connected and self.running and self.connection_generation == generation do
         local message = nil
         if use_event then
-            local ok, msg = pcall(function() return ws.OnMessage:Wait() end)
-            if not ok or msg == nil then
+            local received, value = pcall(function() return ws.OnMessage:Wait() end)
+            if not received or value == nil then
+                disconnect_reason = received and "WebSocket returned no message" or tostring(value)
                 self.connected = false
                 break
             end
-            message = msg
+            message = value
         else
-            local ok, msg = pcall(function() return ws:Receive() end)
-            if not ok or msg == nil then
+            local received, value = pcall(function() return ws:Receive() end)
+            if not received or value == nil then
+                disconnect_reason = received and "WebSocket returned no message" or tostring(value)
                 self.connected = false
                 break
             end
-            message = msg
+            message = value
         end
 
-        local ok, data = pcall(get_http_service().JSONDecode, get_http_service(), message)
-        if not ok then
-            warn("[Bridge] Invalid JSON:", message)
+        local decoded, data = pcall(game.HttpService.JSONDecode, game.HttpService, message)
+        if not decoded then
+            warn("[Bridge] Invalid JSON message ignored")
             continue
         end
 
         if data.type == "welcome" then
             self.uuid = data.uuid
             welcome_received = true
-            self:_send({
-                type = "hello",
-                protocol = PROTOCOL_VERSION,
-                info = self:_client_info(),
-            })
+            self.connection_state = "Synchronizing"
             print("[Bridge] Received UUID:", self.uuid)
+        elseif data.type == "handler_manifest" then
+            self:_apply_handler_manifest(data)
+            if self.handler_sync_ready then self.connection_state = "Connected" end
+        elseif data.type == "handler_update" then
+            self:_apply_handler_update(data)
+        elseif data.type == "handler_remove" then
+            self:_apply_handler_remove(data)
         elseif data.type == "shutdown" then
             print("[Bridge] Server is shutting down - disconnecting permanently.")
             self.running = false
             self.connected = false
-            pcall(function() self.ws:Close() end)
+            disconnect_reason = "Server requested shutdown"
+            pcall(function() ws:Close() end)
             break
-        elseif data.type == "handler_manifest" then
-            self:_replace_manifest(data.handlers)
-        elseif data.type == "handler_update" then
-            self:_load_handler(data.handler or {})
-        elseif data.type == "handler_remove" then
-            self:Off(tostring(data.handler_id))
-            self:_ack(tostring(data.handler_id), "ok", "removed")
-        elseif data.type == "handler_clear" then
-            self:_replace_manifest({})
         elseif data.type == "command" then
             if not welcome_received then
                 warn("[Bridge] Received command before welcome, ignoring")
                 continue
             end
-            self:_handle_command(data)
+            local handled, result = self:_execute_handler(data)
+            local reply = game.HttpService:JSONEncode({
+                type = "result",
+                protocol = HANDLER_PROTOCOL_VERSION,
+                request_id = data.request_id,
+                success = handled,
+                result = handled and result or nil,
+                error = handled and nil or result
+            })
+            pcall(function()
+                if self.ws == ws then self.ws:Send(reply) end
+            end)
+        end
+        if self.permanent_sync_error then
+            self.connected = false
+            disconnect_reason = self.permanent_sync_error
+            pcall(function() ws:Close() end)
+            break
         end
     end
 
-    self.ws = nil
-    if self.running then
-        print("[Bridge] WebSocket disconnected. Reconnecting in " .. self.reconnect_delay .. "s...")
+    if self.ws == ws then
+        self.ws = nil
     end
+    self.connected = false
+    self.connection_state = "Disconnected"
+    local stable = welcome_received and self.handler_sync_ready and (os.clock() - connected_at >= STABLE_CONNECTION_SECONDS)
+    if self.permanent_sync_error then
+        return false, self.permanent_sync_error, stable
+    end
+    return true, disconnect_reason, stable
 end
 
 function Bridge:Disconnect()
+    self.connection_generation += 1
     self.running = false
     self.connected = false
-    if self.ws then
-        pcall(function() self.ws:Close() end)
+    self.connection_state = "Closing"
+    self.retry_attempt = 0
+    local ws = self.ws
+    self.ws = nil
+    if ws then
+        pcall(function() ws:Close() end)
     end
+    self.connection_state = "Disconnected"
 end
 
 return Bridge.new()
