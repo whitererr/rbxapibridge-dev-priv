@@ -93,9 +93,33 @@ function Bridge:_compile_handler(entry)
     return false, "handler_source_invalid: handler must return a function, a table with Run, or a result"
 end
 
+function Bridge:_send_payload(payload, purpose)
+    local ws = self.ws
+    if not ws or not self.connected then
+        warn("[Bridge] Cannot send " .. tostring(purpose) .. ": WebSocket is not connected")
+        return false
+    end
+    local encoded_ok, encoded_or_error = pcall(game.HttpService.JSONEncode, game.HttpService, payload)
+    if not encoded_ok then
+        warn("[Bridge] Cannot encode " .. tostring(purpose) .. ": " .. tostring(encoded_or_error))
+        return false
+    end
+    task.spawn(function()
+        if self.ws ~= ws or not self.connected then
+            return
+        end
+        local sent, send_result, send_error = pcall(function()
+            ws:Send(encoded_or_error)
+        end)
+        if not sent or send_result == false then
+            warn("[Bridge] Failed to send " .. tostring(purpose) .. ": " .. tostring(send_error or send_result))
+        end
+    end)
+    return true
+end
+
 function Bridge:_send_sync_result(revision, success, handler_errors, message)
-    if not self.ws then return end
-    local payload = game.HttpService:JSONEncode({
+    local payload = {
         type = "handler_sync_result",
         protocol = HANDLER_PROTOCOL_VERSION,
         revision = revision,
@@ -103,8 +127,8 @@ function Bridge:_send_sync_result(revision, success, handler_errors, message)
         loaded_handlers = table_count(self.synced_handlers),
         handler_errors = handler_errors,
         error = message
-    })
-    pcall(function() self.ws:Send(payload) end)
+    }
+    return self:_send_payload(payload, "handler synchronization acknowledgement")
 end
 
 function Bridge:_apply_handler_manifest(data)
@@ -139,6 +163,7 @@ function Bridge:_apply_handler_manifest(data)
     self.handler_sync_failed_revision = next(failures) and data.revision or 0
     self.update_failures = {}
     self.permanent_sync_error = nil
+    print("[Bridge] Handler manifest applied: revision " .. tostring(data.revision) .. ", loaded " .. tostring(table_count(next_registry)))
     self:_send_sync_result(data.revision, next(failures) == nil, next(failures) and failures or nil,
         next(failures) and "handler_manifest_partially_loaded" or nil)
 end
@@ -433,17 +458,14 @@ function Bridge:_connect_and_listen(generation)
                 continue
             end
             local handled, result = self:_execute_handler(data)
-            local reply = game.HttpService:JSONEncode({
+            self:_send_payload({
                 type = "result",
                 protocol = HANDLER_PROTOCOL_VERSION,
                 request_id = data.request_id,
                 success = handled,
                 result = handled and result or nil,
                 error = handled and nil or result
-            })
-            pcall(function()
-                if self.ws == ws then self.ws:Send(reply) end
-            end)
+            }, "command result")
         end
         if self.permanent_sync_error then
             self.connected = false
