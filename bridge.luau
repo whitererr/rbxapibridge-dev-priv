@@ -385,6 +385,9 @@ function Bridge:_connect_and_listen(generation)
     print("[Bridge] WebSocket connected, waiting for welcome...")
 
     local use_event = false
+    local event_inbox = {}
+    local event_connection = nil
+    local event_overflow = nil
     if ws.Receive and type(ws.Receive) == "function" then
         use_event = false
     elseif ws.OnMessage then
@@ -396,6 +399,30 @@ function Bridge:_connect_and_listen(generation)
         return false, "WebSocket has no Receive/OnMessage interface", false
     end
 
+    if use_event then
+        local subscribed, connection_or_error = pcall(function()
+            return ws.OnMessage:Connect(function(message)
+                if type(message) ~= "string" then
+                    return
+                end
+                if #event_inbox >= 64 then
+                    event_overflow = "WebSocket message queue overflow"
+                    self.connected = false
+                    pcall(function() ws:Close() end)
+                    return
+                end
+                table.insert(event_inbox, message)
+            end)
+        end)
+        if subscribed and connection_or_error then
+            event_connection = connection_or_error
+        else
+            -- Some older adapters expose Wait but not Connect. The server's
+            -- readiness fallback still gives that path time to begin waiting.
+            use_event = "wait"
+        end
+    end
+
     if ws.OnClose then
         ws.OnClose:Connect(function()
             if self.ws == ws and self.connection_generation == generation then
@@ -405,11 +432,31 @@ function Bridge:_connect_and_listen(generation)
         end)
     end
 
+    -- The server holds its first manifest until this is sent, preventing an
+    -- OnMessage-only adapter from losing frames before Wait has subscribed.
+    self:_send_payload({
+        type = "client_ready",
+        protocol = HANDLER_PROTOCOL_VERSION
+    }, "client readiness")
+    print("[Bridge] WebSocket ready, waiting for welcome...")
+
     local welcome_received = false
     local disconnect_reason = "WebSocket connection closed"
     while self.connected and self.running and self.connection_generation == generation do
         local message = nil
-        if use_event then
+        if use_event == true then
+            while #event_inbox == 0 and self.connected and self.running and self.connection_generation == generation do
+                task.wait()
+            end
+            if event_overflow then
+                disconnect_reason = event_overflow
+                break
+            end
+            if #event_inbox == 0 then
+                break
+            end
+            message = table.remove(event_inbox, 1)
+        elseif use_event == "wait" then
             local received, value = pcall(function() return ws.OnMessage:Wait() end)
             if not received or value == nil then
                 disconnect_reason = received and "WebSocket returned no message" or tostring(value)
@@ -477,6 +524,9 @@ function Bridge:_connect_and_listen(generation)
 
     if self.ws == ws then
         self.ws = nil
+    end
+    if event_connection then
+        pcall(function() event_connection:Disconnect() end)
     end
     self.connected = false
     self.connection_state = "Disconnected"
