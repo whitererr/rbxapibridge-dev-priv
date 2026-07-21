@@ -59,6 +59,18 @@ function Bridge.new()
 end
 
 function Bridge:On(handler_name, callback)
+    if self.loading_handler_id then
+        if handler_name ~= self.loading_handler_id then
+            self.loading_handler_error = "handler_registration_invalid: expected " .. self.loading_handler_id .. ", got " .. tostring(handler_name)
+        elseif type(callback) ~= "function" then
+            self.loading_handler_error = "handler_registration_invalid: callback must be a function"
+        elseif self.loading_handler_callback then
+            self.loading_handler_error = "handler_registration_invalid: handler registered more than once"
+        else
+            self.loading_handler_callback = callback
+        end
+        return
+    end
     self.handlers[handler_name] = callback
 end
 
@@ -79,15 +91,39 @@ function Bridge:_compile_handler(entry)
     if not compiled then
         return false, "handler_compile_failed: " .. tostring(compile_error)
     end
+    if type(setfenv) == "function" then
+        local environment = setmetatable({ Bridge = self }, {
+            __index = getfenv and getfenv(0) or _G
+        })
+        local configured, configuration_error = pcall(setfenv, compiled, environment)
+        if not configured then
+            return false, "handler_environment_failed: " .. tostring(configuration_error)
+        end
+    end
+    self.loading_handler_id = entry.id
+    self.loading_handler_callback = nil
+    self.loading_handler_error = nil
     local loaded, exported = pcall(compiled)
+    local registered = self.loading_handler_callback
+    local registration_error = self.loading_handler_error
+    self.loading_handler_id = nil
+    self.loading_handler_callback = nil
+    self.loading_handler_error = nil
     if not loaded then
         return false, "handler_load_failed: " .. tostring(exported)
+    end
+    if registration_error then
+        return false, registration_error
     end
     if type(exported) == "function" then
         return true, exported
     elseif type(exported) == "table" and type(exported.Run) == "function" then
         return true, function(args) return exported.Run(args) end
-    elseif exported ~= nil then
+    end
+    if registered then
+        return true, registered
+    end
+    if exported ~= nil then
         return true, function() return exported end
     end
     return false, "handler_source_invalid: handler must return a function, a table with Run, or a result"
