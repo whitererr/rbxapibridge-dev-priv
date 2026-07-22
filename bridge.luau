@@ -21,9 +21,27 @@ local function is_permanent_connect_error(message)
     local text = string.lower(tostring(message or ""))
     return string.find(text, "unauthorized", 1, true) ~= nil
         or string.find(text, "authentication", 1, true) ~= nil
+        or string.find(text, "api key", 1, true) ~= nil
         or string.find(text, "401", 1, true) ~= nil
         or string.find(text, "403", 1, true) ~= nil
         or string.find(text, "invalid url", 1, true) ~= nil
+end
+
+local function describe_connect_error(message)
+    local text = string.lower(tostring(message or ""))
+    if string.find(text, "no api key is configured", 1, true) ~= nil
+        or string.find(text, "409", 1, true) ~= nil then
+        return "No API key is configured on this server; connect without an API key"
+    end
+    if string.find(text, "api key is incorrect", 1, true) ~= nil
+        or string.find(text, "403", 1, true) ~= nil then
+        return "API key is incorrect"
+    end
+    if string.find(text, "api key is required", 1, true) ~= nil
+        or string.find(text, "401", 1, true) ~= nil then
+        return "API key is required"
+    end
+    return tostring(message or "WebSocket connection failed")
 end
 
 function Bridge.new()
@@ -406,12 +424,12 @@ function Bridge:_connect_and_listen(generation)
     end
     local ok, ws_or_error = pcall(ws_connect, full_url)
     if not ok then
-        local reason = tostring(ws_or_error)
+        local reason = describe_connect_error(ws_or_error)
         return not is_permanent_connect_error(reason), reason, false
     end
     local ws = ws_or_error
     if not ws then
-        return true, "WebSocket connection failed", false
+        return false, "WebSocket connection failed; check the server URL and API key configuration", false
     end
     if self.connection_generation ~= generation or not self.running then
         pcall(function() ws:Close() end)
