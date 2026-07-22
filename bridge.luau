@@ -541,14 +541,18 @@ function Bridge:_connect_and_listen(generation)
                 continue
             end
             local handled, result = self:_execute_handler(data)
-            self:_send_payload({
+            local response = {
                 type = "result",
                 protocol = HANDLER_PROTOCOL_VERSION,
                 request_id = data.request_id,
-                success = handled,
-                result = handled and result or nil,
-                error = handled and nil or result
-            }, "command result")
+                success = handled
+            }
+            if handled then
+                response.result = result
+            else
+                response.error = tostring(result)
+            end
+            self:_send_payload(response, "command result")
         end
         if self.permanent_sync_error then
             self.connected = false
