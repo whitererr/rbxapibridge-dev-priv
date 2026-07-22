@@ -308,8 +308,9 @@ function Bridge:_execute_handler(data)
     return true, response
 end
 
-function Bridge:Connect(server_url)
+function Bridge:Connect(server_url, api_key)
     assert(type(server_url) == "string" and server_url ~= "", "Server URL required")
+    assert(api_key == nil or type(api_key) == "string", "API key must be a string")
 
     self.connection_generation += 1
     local generation = self.connection_generation
@@ -319,6 +320,7 @@ function Bridge:Connect(server_url)
     self.retry_attempt = 0
     self.permanent_sync_error = nil
     self.url = server_url
+    self.api_key = api_key
 
     if self.ws then
         pcall(function() self.ws:Close() end)
@@ -399,6 +401,9 @@ function Bridge:_connect_and_listen(generation)
 
     local separator = string.find(self.url, "?", 1, true) and "&" or "?"
     local full_url = self.url .. separator .. "cid=" .. self.client_id
+    if self.api_key and self.api_key ~= "" then
+        full_url ..= "&api_key=" .. game.HttpService:UrlEncode(self.api_key)
+    end
     local ok, ws_or_error = pcall(ws_connect, full_url)
     if not ok then
         local reason = tostring(ws_or_error)
