@@ -24,22 +24,18 @@ local function is_permanent_connect_error(message)
         or string.find(text, "api key", 1, true) ~= nil
         or string.find(text, "401", 1, true) ~= nil
         or string.find(text, "403", 1, true) ~= nil
+		or string.find(text, "409", 1, true) ~= nil
+		or string.find(text, "ticket", 1, true) ~= nil
         or string.find(text, "invalid url", 1, true) ~= nil
 end
 
 local function describe_connect_error(message)
     local text = string.lower(tostring(message or ""))
-    if string.find(text, "no api key is configured", 1, true) ~= nil
+    if string.find(text, "ticket", 1, true) ~= nil
+        or string.find(text, "401", 1, true) ~= nil
+        or string.find(text, "403", 1, true) ~= nil
         or string.find(text, "409", 1, true) ~= nil then
-        return "No API key is configured on this server; connect without an API key"
-    end
-    if string.find(text, "api key is incorrect", 1, true) ~= nil
-        or string.find(text, "403", 1, true) ~= nil then
-        return "API key is incorrect"
-    end
-    if string.find(text, "api key is required", 1, true) ~= nil
-        or string.find(text, "401", 1, true) ~= nil then
-        return "API key is required"
+        return "WebSocket ticket is invalid, expired, or already used; request a new ticket from the bridge API"
     end
     return tostring(message or "WebSocket connection failed")
 end
@@ -93,58 +89,15 @@ function Bridge:On(handler_name, callback)
 end
 
 function Bridge:_compile_handler(entry)
-    if entry.server_owned then
-        return true, nil
+    if entry.server_owned then return true, nil end
+    if type(entry.id) ~= "string" or entry.id == "" then
+        return false, "handler_manifest_invalid: invalid handler entry"
     end
-    if type(entry.id) ~= "string" or entry.id == "" or type(entry.source) ~= "string" then
-        return false, "handler_source_invalid: invalid handler entry"
+    local handler = self.handlers[entry.id]
+    if type(handler) ~= "function" then
+        return false, "handler_not_registered_locally: " .. entry.id
     end
-    if type(loadstring) ~= "function" then
-        return false, "client_dynamic_handlers_unsupported: loadstring is unavailable"
-    end
-    local compile_ok, compiled, compile_error = pcall(loadstring, entry.source, "@bridge-handler/" .. entry.id)
-    if not compile_ok then
-        return false, "handler_compile_failed: " .. tostring(compiled)
-    end
-    if not compiled then
-        return false, "handler_compile_failed: " .. tostring(compile_error)
-    end
-    if type(setfenv) == "function" then
-        local environment = setmetatable({ Bridge = self }, {
-            __index = getfenv and getfenv(0) or _G
-        })
-        local configured, configuration_error = pcall(setfenv, compiled, environment)
-        if not configured then
-            return false, "handler_environment_failed: " .. tostring(configuration_error)
-        end
-    end
-    self.loading_handler_id = entry.id
-    self.loading_handler_callback = nil
-    self.loading_handler_error = nil
-    local loaded, exported = pcall(compiled)
-    local registered = self.loading_handler_callback
-    local registration_error = self.loading_handler_error
-    self.loading_handler_id = nil
-    self.loading_handler_callback = nil
-    self.loading_handler_error = nil
-    if not loaded then
-        return false, "handler_load_failed: " .. tostring(exported)
-    end
-    if registration_error then
-        return false, registration_error
-    end
-    if type(exported) == "function" then
-        return true, exported
-    elseif type(exported) == "table" and type(exported.Run) == "function" then
-        return true, function(args) return exported.Run(args) end
-    end
-    if registered then
-        return true, registered
-    end
-    if exported ~= nil then
-        return true, function() return exported end
-    end
-    return false, "handler_source_invalid: handler must return a function, a table with Run, or a result"
+    return true, handler
 end
 
 function Bridge:_send_payload(payload, purpose)
@@ -284,35 +237,6 @@ end
 
 function Bridge:_execute_handler(data)
     local handler = self.synced_handlers[data.handler] or self.handlers[data.handler]
-    if data.handler_source then
-        if type(loadstring) ~= "function" then
-            return false, "client_dynamic_handlers_unsupported: loadstring is unavailable"
-        end
-        local compile_ok, compiled, compile_error = pcall(
-            loadstring,
-            data.handler_source,
-            "@bridge-handler/" .. tostring(data.handler)
-        )
-        if not compile_ok then
-            return false, "handler_compile_failed: " .. tostring(compiled)
-        end
-        if not compiled then
-            return false, "handler_compile_failed: " .. tostring(compile_error)
-        end
-        local loaded, exported = pcall(compiled)
-        if not loaded then
-            return false, "handler_load_failed: " .. tostring(exported)
-        end
-        if type(exported) == "function" then
-            handler = exported
-        elseif type(exported) == "table" and type(exported.Run) == "function" then
-            handler = function(args) return exported.Run(args) end
-        elseif exported ~= nil then
-            return true, exported
-        else
-            return false, "handler_source_invalid: handler must return a function, a table with Run, or a result"
-        end
-    end
     if not handler then
         if not self.handler_sync_ready then
             return false, "handler_synchronization_pending: revision " .. tostring(self.handler_revision)
@@ -326,9 +250,9 @@ function Bridge:_execute_handler(data)
     return true, response
 end
 
-function Bridge:Connect(server_url, api_key)
+function Bridge:Connect(server_url, ticket)
     assert(type(server_url) == "string" and server_url ~= "", "Server URL required")
-    assert(api_key == nil or type(api_key) == "string", "API key must be a string")
+    assert(type(ticket) == "string" and ticket ~= "", "WebSocket ticket required")
 
     self.connection_generation += 1
     local generation = self.connection_generation
@@ -338,7 +262,7 @@ function Bridge:Connect(server_url, api_key)
     self.retry_attempt = 0
     self.permanent_sync_error = nil
     self.url = server_url
-    self.api_key = api_key
+    self.ticket = ticket
 
     if self.ws then
         pcall(function() self.ws:Close() end)
@@ -418,10 +342,7 @@ function Bridge:_connect_and_listen(generation)
     end
 
     local separator = string.find(self.url, "?", 1, true) and "&" or "?"
-    local full_url = self.url .. separator .. "cid=" .. self.client_id
-    if self.api_key and self.api_key ~= "" then
-        full_url ..= "&api_key=" .. game.HttpService:UrlEncode(self.api_key)
-    end
+    local full_url = self.url .. separator .. "ticket=" .. game.HttpService:UrlEncode(self.ticket)
     local ok, ws_or_error = pcall(ws_connect, full_url)
     if not ok then
         local reason = describe_connect_error(ws_or_error)
@@ -497,6 +418,14 @@ function Bridge:_connect_and_listen(generation)
         type = "client_ready",
         protocol = HANDLER_PROTOCOL_VERSION
     }, "client readiness")
+    task.spawn(function()
+        while self.ws == ws and self.connected and self.running and self.connection_generation == generation do
+            task.wait(15)
+            if self.ws == ws and self.connected and self.running and self.connection_generation == generation then
+                self:_send_payload({ type = "heartbeat", protocol = HANDLER_PROTOCOL_VERSION }, "heartbeat")
+            end
+        end
+    end)
     print("[Bridge] WebSocket ready, waiting for welcome...")
 
     local welcome_received = false
